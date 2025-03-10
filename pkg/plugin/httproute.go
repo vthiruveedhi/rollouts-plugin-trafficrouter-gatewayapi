@@ -38,7 +38,10 @@ func (r *RpcPlugin) setHTTPRouteWeight(rollout *v1alpha1.Rollout, desiredWeight 
 	// Get experiment services if experiment step is active
 	experimentCanaryServiceName := ""
 	experimentBaselineServiceName := ""
+	experimentCanaryWeight := int32(0)
+	experimentBaselineWeight := int32(0)
 	experimentWeight := int32(0)
+	hasExperiment := false
 
 	// Check if this is an experiment step by examining the current step
 	if rollout.Spec.Strategy.Canary.Steps != nil && rollout.Status.CurrentStepIndex != nil {
@@ -48,19 +51,22 @@ func (r *RpcPlugin) setHTTPRouteWeight(rollout *v1alpha1.Rollout, desiredWeight 
 			if currentStep.Experiment != nil {
 				// This is an experiment step
 				r.LogCtx.Logger.Info("Found experiment step")
+				hasExperiment = true
 
 				// Check if templates are defined and extract weights from templates
 				if currentStep.Experiment.Templates != nil && len(currentStep.Experiment.Templates) > 0 {
 					for _, template := range currentStep.Experiment.Templates {
 						if template.Name == "experiment-canary" && template.Weight != nil {
 							experimentCanaryServiceName = fmt.Sprintf("%s-%s", rollout.Name, template.Name)
-							experimentWeight += *template.Weight
-							r.LogCtx.Logger.Info(fmt.Sprintf("Found experiment template: %s with weight: %d", template.Name, *template.Weight))
+							experimentCanaryWeight = *template.Weight
+							experimentWeight += experimentCanaryWeight
+							r.LogCtx.Logger.Info(fmt.Sprintf("Found experiment template: %s with weight: %d", template.Name, experimentCanaryWeight))
 						}
 						if template.Name == "experiment-baseline" && template.Weight != nil {
 							experimentBaselineServiceName = fmt.Sprintf("%s-%s", rollout.Name, template.Name)
-							experimentWeight += *template.Weight
-							r.LogCtx.Logger.Info(fmt.Sprintf("Found experiment template: %s with weight: %d", template.Name, *template.Weight))
+							experimentBaselineWeight = *template.Weight
+							experimentWeight += experimentBaselineWeight
+							r.LogCtx.Logger.Info(fmt.Sprintf("Found experiment template: %s with weight: %d", template.Name, experimentBaselineWeight))
 						}
 					}
 				}
@@ -70,6 +76,26 @@ func (r *RpcPlugin) setHTTPRouteWeight(rollout *v1alpha1.Rollout, desiredWeight 
 
 	routeRuleList := HTTPRouteRuleList(httpRoute.Spec.Rules)
 
+	// Calculate weights based on whether experiment is active
+	stableWeight := int32(100)
+	canaryWeight := desiredWeight
+
+	if hasExperiment {
+		// Adjust canary weight if needed
+		if desiredWeight > experimentWeight {
+			canaryWeight = desiredWeight - experimentWeight
+		} else {
+			canaryWeight = 0
+		}
+
+		// Remaining weight goes to stable
+		stableWeight = 100 - canaryWeight - experimentWeight
+	} else {
+		// No experiment, use original weight calculation
+		stableWeight = 100 - desiredWeight
+	}
+
+	// Process all backend references for existing services
 	canaryBackendRefs, err := getBackendRefs(canaryServiceName, routeRuleList)
 	if err != nil {
 		return pluginTypes.RpcError{
@@ -84,86 +110,6 @@ func (r *RpcPlugin) setHTTPRouteWeight(rollout *v1alpha1.Rollout, desiredWeight 
 		}
 	}
 
-	// If experiment is active, get experiment backend refs
-	var experimentCanaryBackendRefs []*HTTPBackendRef
-	var experimentBaselineBackendRefs []*HTTPBackendRef
-
-	if experimentCanaryServiceName != "" {
-		experimentCanaryBackendRefs, err = getBackendRefs(experimentCanaryServiceName, routeRuleList)
-		if err != nil {
-			// If experiment service backend refs not found, we'll need to add them
-			r.LogCtx.Logger.Info(fmt.Sprintf("Experiment canary service %s not found in HTTP route, will create it", experimentCanaryServiceName))
-		}
-	}
-
-	if experimentBaselineServiceName != "" {
-		experimentBaselineBackendRefs, err = getBackendRefs(experimentBaselineServiceName, routeRuleList)
-		if err != nil {
-			// If experiment service backend refs not found, we'll need to add them
-			r.LogCtx.Logger.Info(fmt.Sprintf("Experiment baseline service %s not found in HTTP route, will create it", experimentBaselineServiceName))
-		}
-	}
-
-	// Calculate weights based on whether experiment is active
-	stableWeight := int32(100)
-	canaryWeight := desiredWeight
-
-	if experimentWeight > 0 {
-		// Since we're handling each template with its own weight, we don't need to divide evenly
-		experimentCanaryWeight := int32(0)
-		experimentBaselineWeight := int32(0)
-
-		// Get individual weights from the templates
-		if rollout.Status.CurrentStepIndex != nil {
-			currentStepIndex := *rollout.Status.CurrentStepIndex
-			if currentStepIndex < int32(len(rollout.Spec.Strategy.Canary.Steps)) {
-				currentStep := rollout.Spec.Strategy.Canary.Steps[currentStepIndex]
-				if currentStep.Experiment != nil && currentStep.Experiment.Templates != nil {
-					for _, template := range currentStep.Experiment.Templates {
-						if template.Name == "experiment-canary" && template.Weight != nil {
-							experimentCanaryWeight = *template.Weight
-						}
-						if template.Name == "experiment-baseline" && template.Weight != nil {
-							experimentBaselineWeight = *template.Weight
-						}
-					}
-				}
-			}
-		}
-
-		// Adjust canary weight if needed
-		if desiredWeight > experimentWeight {
-			canaryWeight = desiredWeight - experimentWeight
-		} else {
-			canaryWeight = 0
-		}
-
-		// Remaining weight goes to stable
-		stableWeight = 100 - canaryWeight - experimentWeight
-
-		// Set weights for experiment services
-		if len(experimentCanaryBackendRefs) > 0 {
-			for _, ref := range experimentCanaryBackendRefs {
-				ref.Weight = &experimentCanaryWeight
-			}
-		} else if experimentCanaryServiceName != "" {
-			// Need to add experiment canary service to the route rule
-			addExperimentServiceToRoute(httpRoute, experimentCanaryServiceName, experimentCanaryWeight)
-		}
-
-		if len(experimentBaselineBackendRefs) > 0 {
-			for _, ref := range experimentBaselineBackendRefs {
-				ref.Weight = &experimentBaselineWeight
-			}
-		} else if experimentBaselineServiceName != "" {
-			// Need to add experiment baseline service to the route rule
-			addExperimentServiceToRoute(httpRoute, experimentBaselineServiceName, experimentBaselineWeight)
-		}
-	} else {
-		// No experiment, use original weight calculation
-		stableWeight = 100 - desiredWeight
-	}
-
 	// Set weights for canary and stable services
 	for _, ref := range canaryBackendRefs {
 		ref.Weight = &canaryWeight
@@ -172,7 +118,117 @@ func (r *RpcPlugin) setHTTPRouteWeight(rollout *v1alpha1.Rollout, desiredWeight 
 		ref.Weight = &stableWeight
 	}
 
+	// Handle experiment services
+	if hasExperiment {
+		// We need to first check if experiment services exist in the route
+		experimentCanaryExists := false
+		experimentBaselineExists := false
+
+		if experimentCanaryServiceName != "" {
+			experimentCanaryBackendRefs, err := getBackendRefs(experimentCanaryServiceName, routeRuleList)
+			if err == nil && len(experimentCanaryBackendRefs) > 0 {
+				// Service exists, update weights
+				for _, ref := range experimentCanaryBackendRefs {
+					ref.Weight = &experimentCanaryWeight
+				}
+				experimentCanaryExists = true
+			}
+		}
+
+		if experimentBaselineServiceName != "" {
+			experimentBaselineBackendRefs, err := getBackendRefs(experimentBaselineServiceName, routeRuleList)
+			if err == nil && len(experimentBaselineBackendRefs) > 0 {
+				// Service exists, update weights
+				for _, ref := range experimentBaselineBackendRefs {
+					ref.Weight = &experimentBaselineWeight
+				}
+				experimentBaselineExists = true
+			}
+		}
+
+		// For any experiment services that don't exist, we need to add them
+		if experimentCanaryServiceName != "" && !experimentCanaryExists {
+			r.LogCtx.Logger.Info(fmt.Sprintf("Adding experiment canary service %s to HTTP route with weight %d",
+				experimentCanaryServiceName, experimentCanaryWeight))
+
+			// Need to add experiment canary service to all rules that contain our canary and stable services
+			for i := range httpRoute.Spec.Rules {
+				// Check if this rule contains our canary or stable service
+				containsCanaryOrStable := false
+				for _, backendRef := range httpRoute.Spec.Rules[i].BackendRefs {
+					if string(backendRef.Name) == canaryServiceName || string(backendRef.Name) == stableServiceName {
+						containsCanaryOrStable = true
+						break
+					}
+				}
+
+				if containsCanaryOrStable {
+					serviceKind := gatewayv1.Kind("Service")
+					serviceGroup := gatewayv1.Group("")
+					port := gatewayv1.PortNumber(80) // Default port, might need to be configurable
+
+					experimentBackendRef := gatewayv1.HTTPBackendRef{
+						BackendRef: gatewayv1.BackendRef{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Group: &serviceGroup,
+								Kind:  &serviceKind,
+								Name:  gatewayv1.ObjectName(experimentCanaryServiceName),
+								Port:  &port,
+							},
+							Weight: &experimentCanaryWeight,
+						},
+					}
+
+					httpRoute.Spec.Rules[i].BackendRefs = append(httpRoute.Spec.Rules[i].BackendRefs, experimentBackendRef)
+				}
+			}
+		}
+
+		if experimentBaselineServiceName != "" && !experimentBaselineExists {
+			r.LogCtx.Logger.Info(fmt.Sprintf("Adding experiment baseline service %s to HTTP route with weight %d",
+				experimentBaselineServiceName, experimentBaselineWeight))
+
+			// Need to add experiment baseline service to all rules that contain our canary and stable services
+			for i := range httpRoute.Spec.Rules {
+				// Check if this rule contains our canary or stable service
+				containsCanaryOrStable := false
+				for _, backendRef := range httpRoute.Spec.Rules[i].BackendRefs {
+					if string(backendRef.Name) == canaryServiceName || string(backendRef.Name) == stableServiceName {
+						containsCanaryOrStable = true
+						break
+					}
+				}
+
+				if containsCanaryOrStable {
+					serviceKind := gatewayv1.Kind("Service")
+					serviceGroup := gatewayv1.Group("")
+					port := gatewayv1.PortNumber(80) // Default port, might need to be configurable
+
+					experimentBackendRef := gatewayv1.HTTPBackendRef{
+						BackendRef: gatewayv1.BackendRef{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Group: &serviceGroup,
+								Kind:  &serviceKind,
+								Name:  gatewayv1.ObjectName(experimentBaselineServiceName),
+								Port:  &port,
+							},
+							Weight: &experimentBaselineWeight,
+						},
+					}
+
+					httpRoute.Spec.Rules[i].BackendRefs = append(httpRoute.Spec.Rules[i].BackendRefs, experimentBackendRef)
+				}
+			}
+		}
+	} else {
+		// If no experiment is active, we should remove experiment services if they exist
+		// This would require additional code to handle cleanup
+	}
+
 	// Update the HTTP route
+	r.LogCtx.Logger.Info(fmt.Sprintf("Updating HTTPRoute %s with weights: stable=%d%%, canary=%d%%, experiment=%d%%",
+		gatewayAPIConfig.HTTPRoute, stableWeight, canaryWeight, experimentWeight))
+
 	updatedHTTPRoute, err := httpRouteClient.Update(ctx, httpRoute, metav1.UpdateOptions{})
 	if r.IsTest {
 		r.UpdatedHTTPRouteMock = updatedHTTPRoute
