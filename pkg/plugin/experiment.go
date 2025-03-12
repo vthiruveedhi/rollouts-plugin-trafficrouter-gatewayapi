@@ -6,6 +6,7 @@ import (
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayApiClientset "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
@@ -30,7 +31,7 @@ func HandleExperiment(ctx context.Context, clientset *kubernetes.Clientset, gate
 			break
 		}
 		for _, backendRef := range rule.BackendRefs {
-			if backendRef.Name == gatewayv1.ObjectName(stableService) || backendRef.Name == gatewayv1.ObjectName(canaryService) {
+			if string(backendRef.Name) == stableService || string(backendRef.Name) == canaryService {
 				ruleIdx = i
 				break
 			}
@@ -45,6 +46,15 @@ func HandleExperiment(ctx context.Context, clientset *kubernetes.Clientset, gate
 	if len(rollout.Status.Canary.Weights.Additional) == 0 {
 		logger.Info("No experiment services found in rollout status, skipping experiment service addition")
 		return nil
+	}
+
+	// First, update the stable service weight to ensure proper traffic distribution
+	stableWeight := int32(45) // Default to 45% for the stable service when experiments are active
+	for i, backendRef := range httpRoute.Spec.Rules[ruleIdx].BackendRefs {
+		if string(backendRef.Name) == stableService {
+			httpRoute.Spec.Rules[ruleIdx].BackendRefs[i].Weight = &stableWeight
+			break
+		}
 	}
 
 	// Process each additional service (these are the experiment services)
@@ -64,8 +74,30 @@ func HandleExperiment(ctx context.Context, clientset *kubernetes.Clientset, gate
 		if !exists {
 			logger.Info(fmt.Sprintf("Adding experiment service to HTTPRoute: %s with weight %d", serviceName, weight))
 
+			// Get the actual service port by querying the Kubernetes API
+			service, err := clientset.CoreV1().Services(rollout.Namespace).Get(ctx, serviceName, metav1.GetOptions{})
+			if err != nil {
+				logger.Warn(fmt.Sprintf("Failed to get service %s: %v", serviceName, err))
+				continue
+			}
+
+			// Default to 8080 if we can't determine the port
+			port := gatewayv1.PortNumber(8080)
+
+			// Find the actual port from the service
+			// if len(service.Spec.Ports) > 0 {
+			// 	port = gatewayv1.PortNumber(service.Spec.Ports[0].Port)
+			// }
+
+			portName := "http" // Common name for HTTP ports
+			for _, servicePort := range service.Spec.Ports {
+				if servicePort.Name == portName {
+					port = gatewayv1.PortNumber(servicePort.Port)
+					break
+				}
+			}
+
 			// Add the experiment service to the backend refs
-			port := gatewayv1.PortNumber(80) // Default port - adjust as needed
 			namespace := gatewayv1.Namespace(rollout.Namespace)
 			httpRoute.Spec.Rules[ruleIdx].BackendRefs = append(httpRoute.Spec.Rules[ruleIdx].BackendRefs, gatewayv1.HTTPBackendRef{
 				BackendRef: gatewayv1.BackendRef{
